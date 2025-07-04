@@ -334,6 +334,7 @@ const BROWSER_ARGUMENTS: &[&str] = &[
     "--in-process-gpu", // Run GPU process in main process
     "--single-process", // Use single process mode for stability
     "--ozone-platform=drm", // Use DRM platform for hardware acceleration
+    "--content-shell-hide-toolbar", // We do not want the toolbar
 ];
 
 /// Start the web browser with robust configuration
