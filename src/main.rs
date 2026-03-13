@@ -1,32 +1,34 @@
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::{exit, Command};
+use std::process::{Child, Command, exit};
 use std::thread;
 use std::time::Duration;
 
 // === Configuration Constants ===
 
 /// Enable debug output for troubleshooting
-const DEBUG_MODE: bool = true;
+const DEBUG_MODE: bool = false;
 
 /// Paths and directories
-const TERMINAL_DEVICE_PATH: &str = "/dev/tty0";
+const TERMINAL_DEVICE_PATH: &str = "/dev/ttyS0";
 const LOG_FILE_PATH: &str = "/mnt/log.txt";
-const CONSOLE_DEVICE_PATH: &str = "/dev/tty0";
+const CONSOLE_DEVICE_PATH: &str = "/dev/ttyS0";
 const DEFAULT_BINARY_PATH: &str = "/bin";
 const MOUNT_POINT_PATH: &str = "/mnt";
 const LOG_STORAGE_DEVICE_PATH: &str = "/dev/sda1";
-const GRAPHICS_DEVICE_PATH: &str = "/dev/dri/card0";
+
+/// Compositor configuration
+const COMPOSITOR_EXECUTABLE_PATH: &str = "/usr/bin/compositor";
+const PROXY_EXECUTABLE_PATH: &str = "/usr/bin/proxy";
 
 /// Browser configuration
-const BROWSER_EXECUTABLE_PATH: &str = "/usr/bin/ui/content_shell";
+const BROWSER_EXECUTABLE_PATH: &str = "/usr/bin/ui";
 const BROWSER_DEFAULT_URL: &str = "http://www.example.com";
 
 /// Environment variables for browser and system
 const EGL_DEBUG_VALUE: &str = "1";
 const EGL_LOG_LEVEL_VALUE: &str = "debug";
-const LIBGL_ALWAYS_SOFTWARE_VALUE: &str = "0";
 const LIBRARY_PATH_VALUE: &str = "/lib:/usr/lib:/lib64:/usr/lib/x86_64-linux-gnu";
 const SYSTEM_PATH_VALUE: &str = "/bin:/usr/bin";
 
@@ -165,14 +167,53 @@ fn execute_shell_command(command: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Spawn a command as a background process without waiting for it to exit.
+fn spawn_background_command(command: &str) -> io::Result<Child> {
+    let command_parts = parse_shell_command(command);
+
+    if command_parts.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Empty command"));
+    }
+
+    let mut full_command_path = command_parts[0].clone();
+
+    // If command does not start with '/', prepend the default binary path
+    if !full_command_path.starts_with('/') {
+        full_command_path = format!("{}/{}", DEFAULT_BINARY_PATH, full_command_path);
+    }
+
+    let mut shell_command = Command::new(&full_command_path);
+    if command_parts.len() > 1 {
+        shell_command.args(&command_parts[1..]);
+    }
+
+    configure_command_environment(&mut shell_command);
+
+    match shell_command.spawn() {
+        Ok(child) => {
+            output_line(&format!(
+                "Spawned background process: {} (pid {})",
+                full_command_path,
+                child.id()
+            ));
+            Ok(child)
+        }
+        Err(spawn_error) => {
+            output_line(&format!(
+                "Failed to spawn background process: {}",
+                spawn_error
+            ));
+            Err(spawn_error)
+        }
+    }
+}
+
 /// Configure environment variables for a command
 /// Sets up EGL, graphics, and path variables needed for browser operation
 fn configure_command_environment(command: &mut Command) {
     command
         .env("EGL_DEBUG", EGL_DEBUG_VALUE)
         .env("EGL_LOG_LEVEL", EGL_LOG_LEVEL_VALUE)
-        .env("DRI_DEVICE", GRAPHICS_DEVICE_PATH)
-        .env("LIBGL_ALWAYS_SOFTWARE", LIBGL_ALWAYS_SOFTWARE_VALUE)
         .env("LD_LIBRARY_PATH", LIBRARY_PATH_VALUE)
         .env("PATH", SYSTEM_PATH_VALUE);
 }
@@ -302,7 +343,7 @@ fn setup_temporary_filesystems() -> io::Result<()> {
 /// This provides persistent storage for log files
 fn mount_log_storage() -> io::Result<()> {
     output_line("Waiting for log storage device to become available...");
-    
+
     // Wait for the log storage device to become available
     loop {
         if std::path::Path::new(LOG_STORAGE_DEVICE_PATH).exists() {
@@ -332,14 +373,23 @@ fn mount_log_storage() -> io::Result<()> {
 const BROWSER_ARGUMENTS: &[&str] = &[
     "--no-sandbox",     // Disable sandbox for embedded systems
     "--in-process-gpu", // Run GPU process in main process
-    "--single-process", // Use single process mode for stability
-    "--ozone-platform=drm", // Use DRM platform for hardware acceleration
+    // "--disable-gpu",                // Software rendering (for VM)
     "--content-shell-hide-toolbar", // We do not want the toolbar
 ];
 
+fn start_compositor() -> io::Result<Child> {
+    spawn_background_command(
+        format!(
+            "{} run --proxy {}",
+            COMPOSITOR_EXECUTABLE_PATH, PROXY_EXECUTABLE_PATH
+        )
+        .as_str(),
+    )
+}
+
 /// Start the web browser with robust configuration
-/// Attempts to launch the browser with comprehensive arguments for embedded systems
-fn start_browser() -> io::Result<()> {
+/// Spawns the browser as a background process for embedded systems
+fn start_browser() -> io::Result<Child> {
     output_line("Starting web browser...");
 
     // Build the complete browser command
@@ -355,8 +405,8 @@ fn start_browser() -> io::Result<()> {
     browser_command.push(' ');
     browser_command.push_str(BROWSER_DEFAULT_URL);
 
-    // Execute the browser command
-    execute_shell_command(&browser_command)
+    // Spawn the browser as a background process
+    spawn_background_command(&browser_command)
 }
 
 // === Interactive Shell ===
@@ -410,36 +460,45 @@ fn run_initialization() -> io::Result<()> {
     output_line("Starting webgate initializer...");
     output_line("Initializing system components...");
 
-    output_line("[1/9]: Setting up symbolic links");
+    output_line("[1/10]: Setting up symbolic links");
     create_symbolic_links()?;
 
-    output_line("[2/9]: Mounting basic filesystems");
+    output_line("[2/10]: Mounting basic filesystems");
     mount_filesystems()?;
 
-    output_line("[3/9]: Starting background sync process");
+    output_line("[3/10]: Starting background sync process");
     start_sync_process()?;
 
-    output_line("[4/9]: Configuring output redirection");
+    output_line("[4/10]: Configuring output redirection");
     redirect_output_to_terminal()?;
 
-    output_line("[5/9]: Setting up temporary filesystems");
+    output_line("[5/10]: Setting up temporary filesystems");
     setup_temporary_filesystems()?;
 
-    output_line("[6/9]: Mounting log storage device");
+    output_line("[6/10]: Mounting log storage device");
     if DEBUG_MODE {
         mount_log_storage()?;
     }
 
-    output_line("[7/9]: Setting up logging");
+    output_line("[7/10]: Setting up logging");
     if DEBUG_MODE {
         redirect_output_to_log_file()?;
     }
 
-    output_line("[8/9]: Launching web browser");
-    start_browser()?;
+    output_line("[8/10]: Launching compositor");
+    let mut compositor_process = start_compositor()?;
 
-    output_line("[9/9]: Starting interactive shell");
+    output_line("[9/10]: Launching web browser");
+    let mut browser_process = start_browser()?;
+
+    output_line("[10/10]: Starting interactive shell");
     interactive_shell()?;
+
+    output_line("Waiting for browser to exit...");
+    let _ = browser_process.wait();
+
+    output_line("Waiting for compositor to exit...");
+    let _ = compositor_process.wait();
 
     output_line("Initialization sequence completed successfully");
     Ok(())
